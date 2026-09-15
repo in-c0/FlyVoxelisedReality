@@ -1,4 +1,4 @@
-#include <glad/glad.h>
+#include <GL/glew.h>
 #include <GLFW/glfw3.h>
 
 #include <glm/glm.hpp>
@@ -26,8 +26,8 @@ constexpr float kVoxelSpacing = 0.16f;
 constexpr float kPi = 3.14159265358979323846f;
 
 struct Instance {
-    glm::vec4 positionScale; // xyz = world position, w = uniform scale
-    glm::vec4 colorMotion;   // rgb = camera colour, w = optical-flow magnitude
+    glm::vec4 positionScale;
+    glm::vec4 colorMotion;
 };
 
 struct AppState {
@@ -72,13 +72,11 @@ uniform mat4 uView;
 uniform mat4 uProjection;
 
 out vec3 vNormal;
-out vec3 vWorldPosition;
 out vec3 vColor;
 out float vMotion;
 
 void main() {
     vec3 world = iPositionScale.xyz + aPosition * iPositionScale.w;
-    vWorldPosition = world;
     vNormal = aNormal;
     vColor = iColorMotion.rgb;
     vMotion = iColorMotion.a;
@@ -89,7 +87,6 @@ void main() {
     static constexpr const char* kFragmentShader = R"GLSL(
 #version 330 core
 in vec3 vNormal;
-in vec3 vWorldPosition;
 in vec3 vColor;
 in float vMotion;
 
@@ -100,11 +97,9 @@ void main() {
     vec3 L = normalize(vec3(-0.45, 0.75, 0.55));
     float diffuse = max(dot(N, L), 0.0);
 
-    // Motion becomes an intentionally visible cyan-green neural-style accent.
     float activity = clamp(vMotion, 0.0, 1.0);
     vec3 activityColour = vec3(0.16, 0.95, 0.72);
     vec3 base = mix(vColor, activityColour, activity * 0.55);
-
     float rim = pow(1.0 - abs(N.z), 3.0) * 0.08;
     vec3 lit = base * (0.30 + 0.70 * diffuse) + activityColour * rim * activity;
     FragColor = vec4(lit, 1.0);
@@ -229,8 +224,6 @@ std::vector<Instance> frameToVoxels(const cv::Mat& bgrSmall, const cv::Mat& flow
                 motion = std::clamp(std::sqrt(f.x * f.x + f.y * f.y) * 0.22f, 0.0f, 1.0f);
             }
 
-            // v0 pseudo-depth: brightness extrudes the camera plane. This deliberately
-            // proves the live CV→voxel→OpenGL path before a true depth model is added.
             const float worldX = (static_cast<float>(x) - (kGridW - 1) * 0.5f) * kVoxelSpacing;
             const float worldY = ((kGridH - 1) * 0.5f - static_cast<float>(y)) * kVoxelSpacing;
             const float worldZ = (luminance - 0.5f) * 1.8f + motion * 0.20f;
@@ -269,11 +262,16 @@ int main() {
         glfwMakeContextCurrent(window);
         glfwSwapInterval(1);
 
-        if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
+        glewExperimental = GL_TRUE;
+        const GLenum glewResult = glewInit();
+        if (glewResult != GLEW_OK) {
             glfwDestroyWindow(window);
             glfwTerminate();
-            throw std::runtime_error("GLAD initialisation failed");
+            throw std::runtime_error(
+                "GLEW initialisation failed: " +
+                std::string(reinterpret_cast<const char*>(glewGetErrorString(glewResult))));
         }
+        glGetError();
 
         AppState state;
         glfwSetWindowUserPointer(window, &state);
@@ -290,24 +288,17 @@ int main() {
 
         const GLuint program = createProgram();
 
-        // Unit cube: position.xyz + normal.xyz, 36 vertices.
         static constexpr float cubeVertices[] = {
-            // back
             -1,-1,-1,  0, 0,-1,   1, 1,-1,  0, 0,-1,   1,-1,-1,  0, 0,-1,
              1, 1,-1,  0, 0,-1,  -1,-1,-1,  0, 0,-1,  -1, 1,-1,  0, 0,-1,
-            // front
             -1,-1, 1,  0, 0, 1,   1,-1, 1,  0, 0, 1,   1, 1, 1,  0, 0, 1,
              1, 1, 1,  0, 0, 1,  -1, 1, 1,  0, 0, 1,  -1,-1, 1,  0, 0, 1,
-            // left
             -1, 1, 1, -1, 0, 0,  -1, 1,-1, -1, 0, 0,  -1,-1,-1, -1, 0, 0,
             -1,-1,-1, -1, 0, 0,  -1,-1, 1, -1, 0, 0,  -1, 1, 1, -1, 0, 0,
-            // right
              1, 1, 1,  1, 0, 0,   1,-1,-1,  1, 0, 0,   1, 1,-1,  1, 0, 0,
              1,-1,-1,  1, 0, 0,   1, 1, 1,  1, 0, 0,   1,-1, 1,  1, 0, 0,
-            // bottom
             -1,-1,-1,  0,-1, 0,   1,-1,-1,  0,-1, 0,   1,-1, 1,  0,-1, 0,
              1,-1, 1,  0,-1, 0,  -1,-1, 1,  0,-1, 0,  -1,-1,-1,  0,-1, 0,
-            // top
             -1, 1,-1,  0, 1, 0,   1, 1, 1,  0, 1, 0,   1, 1,-1,  0, 1, 0,
              1, 1, 1,  0, 1, 0,  -1, 1,-1,  0, 1, 0,  -1, 1, 1,  0, 1, 0
         };
@@ -336,7 +327,6 @@ int main() {
         glEnableVertexAttribArray(3);
         glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(Instance), reinterpret_cast<void*>(sizeof(glm::vec4)));
         glVertexAttribDivisor(3, 1);
-
         glBindVertexArray(0);
 
         glEnable(GL_DEPTH_TEST);
@@ -382,9 +372,7 @@ int main() {
                 cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
 
                 if (!previousGray.empty()) {
-                    cv::calcOpticalFlowFarneback(
-                        previousGray, gray, flow,
-                        0.5, 3, 9, 2, 5, 1.1, 0);
+                    cv::calcOpticalFlowFarneback(previousGray, gray, flow, 0.5, 3, 9, 2, 5, 1.1, 0);
                 } else {
                     flow = cv::Mat::zeros(gray.size(), CV_32FC2);
                 }
