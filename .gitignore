@@ -1,0 +1,11 @@
+build/
+out/
+.vscode/
+.idea/
+.vs/
+CMakeUserPresets.json
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+.DS_Store
