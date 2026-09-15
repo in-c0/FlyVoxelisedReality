@@ -4,23 +4,45 @@
 
 > This repository is an independent technical prototype used to validate the concept before any course group project is scoped. It is intentionally narrower than a complete game.
 
-## v0 goal
+## What works now
 
-Prove the first risky link in the chain with a runnable desktop application:
+### M0 — live CV → OpenGL voxels ✅
 
 ```text
 webcam
   ↓
 OpenCV preprocessing + optical flow
   ↓
-coarse live voxel field
+1,728 live voxel instances
   ↓
 OpenGL instanced rendering
 ```
 
-The first version uses image intensity as a deliberately simple pseudo-depth signal so the camera-to-voxel path is testable without downloading a depth model. True monocular/RGB-D depth, fly-vision transforms, connectome activity, and neural rendering are staged behind later milestones.
+M0 has been validated on Windows with an RTX 2080 and a live webcam.
 
-## Planned pipeline
+### M1 — monocular relative depth → spatial voxel reconstruction 🚧
+
+M1 replaces the original brightness-as-depth experiment with a real monocular depth network:
+
+```text
+webcam RGB
+   ↓
+MiDaS v2.1 Small (OpenCV DNN)
+   ↓
+relative inverse-depth map
+   ↓
+pinhole back-projection
+   ↓
+quantised 3D voxel positions
+   ↓
+OpenGL instanced rendering
+```
+
+Important: MiDaS provides **relative monocular depth**, not calibrated metric distance in metres. The resulting scene has real depth ordering and perspective structure, but it is not yet an accurate metric scan of the room.
+
+Optical flow still runs alongside depth and is visualised as cyan/green activity on moving voxels.
+
+## Planned full pipeline
 
 ```text
 LIVE CAMERA
@@ -41,45 +63,81 @@ NEURAL APPEARANCE
 (learned material / reconstruction pass)
 ```
 
-## v0 controls
+## Controls
 
 - `Esc` — quit
 - `Space` — pause/resume camera-driven voxel updates
+- `D` — toggle monocular depth vs the old brightness fallback
 - `R` — reset camera orbit
-- Drag with **left mouse** — orbit
+- Drag with **left mouse** — orbit around the reconstructed scene
 - Mouse wheel — zoom
+
+## Dependencies
+
+- C++20 compiler
+- OpenGL 3.3+
+- CMake 3.24+ (Visual Studio 2026 users need a recent CMake that knows the VS 18 generator)
+- webcam
+- [vcpkg](https://github.com/microsoft/vcpkg)
+
+The manifest installs GLEW, GLFW, GLM and OpenCV including the DNN module.
+
+## Get the M1 depth model
+
+The model weights are deliberately **not committed** to this repository.
+
+From PowerShell in the repository root:
+
+```powershell
+.\scripts\download_depth_model.ps1
+```
+
+This downloads the official MiDaS v2.1 Small ONNX model to:
+
+```text
+models/model-small.onnx
+```
+
+Source: `isl-org/MiDaS`, MiDaS v2.1 release.
+
+If the model is absent or depth inference fails, the application remains runnable and falls back to the original image-intensity depth experiment. The window title will say `FALLBACK` rather than `DEPTH`.
 
 ## Build
 
-Requirements:
-
-- CMake 3.24+
-- C++20 compiler
-- OpenGL 3.3+
-- a webcam
-- [vcpkg](https://github.com/microsoft/vcpkg)
-
 Install dependencies through the manifest:
 
-```bash
+```powershell
 vcpkg install
-cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+```
+
+Configure and build with your vcpkg toolchain. Example for Visual Studio 2026:
+
+```powershell
+cmake -S . -B build `
+  -G "Visual Studio 18 2026" `
+  -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+
 cmake --build build --config Release
 ```
 
-Then run:
+Run from the repository root so the default `models/model-small.onnx` path resolves:
 
-```bash
-./build/FlyVoxelisedReality
+```powershell
+.\build\Release\FlyVoxelisedReality.exe
 ```
 
-On Visual Studio multi-config generators the executable is usually under `build/Release/`.
+You can also supply a model path explicitly:
+
+```powershell
+.\build\Release\FlyVoxelisedReality.exe "D:\models\model-small.onnx"
+```
 
 ## Milestones
 
 - [x] Repository + architecture scaffold
-- [ ] **M0:** webcam → OpenCV → live OpenGL voxel field
-- [ ] **M1:** true depth/segmentation input
+- [x] **M0:** webcam → OpenCV → live OpenGL voxel field
+- [ ] **M1:** relative monocular depth → spatial voxel reconstruction (implemented; awaiting local validation)
 - [ ] **M2:** fly-inspired compound-eye / motion perception
 - [ ] **M3:** real Drosophila visual-pathway map + live activation
 - [ ] **M4:** researcher ↔ fly dual perspective
