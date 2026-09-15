@@ -2,12 +2,9 @@
   "name": "fly-voxelised-reality",
   "version-string": "0.1.0",
   "dependencies": [
-    "glad",
+    "glew",
     "glfw3",
     "glm",
-    {
-      "name": "opencv4",
-      "features": ["contrib"]
-    }
+    "opencv4"
   ]
 }
