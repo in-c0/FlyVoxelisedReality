@@ -1,3 +1,5 @@
+#include "depth_estimator.hpp"
+
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 
@@ -13,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -22,8 +25,12 @@ namespace {
 
 constexpr int kGridW = 48;
 constexpr int kGridH = 36;
-constexpr float kVoxelSpacing = 0.16f;
+constexpr int kDepthInferenceInterval = 2;
 constexpr float kPi = 3.14159265358979323846f;
+constexpr float kVirtualCameraFovDegrees = 68.0f;
+constexpr float kNearDistance = 0.75f;
+constexpr float kFarDistance = 4.50f;
+constexpr float kVoxelQuantisation = 0.075f;
 
 struct Instance {
     glm::vec4 positionScale;
@@ -35,12 +42,32 @@ struct AppState {
     int framebufferH = 720;
     bool paused = false;
     bool dragging = false;
+    bool depthEnabled = true;
     double lastMouseX = 0.0;
     double lastMouseY = 0.0;
     float yaw = 0.0f;
     float pitch = 0.05f;
     float distance = 7.2f;
 };
+
+float quantise(float value, float step) {
+    return std::round(value / step) * step;
+}
+
+std::string resolveDepthModelPath(int argc, char** argv) {
+    if (argc > 1 && argv[1] != nullptr) return argv[1];
+
+    const std::vector<std::filesystem::path> candidates = {
+        "models/model-small.onnx",
+        "../../../models/model-small.onnx",
+        "../../models/model-small.onnx"
+    };
+
+    for (const auto& candidate : candidates) {
+        if (std::filesystem::exists(candidate)) return candidate.string();
+    }
+    return candidates.front().string();
+}
 
 GLuint compileShader(GLenum type, const char* source) {
     const GLuint shader = glCreateShader(type);
@@ -144,6 +171,7 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
 
     if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, GLFW_TRUE);
     if (key == GLFW_KEY_SPACE) state->paused = !state->paused;
+    if (key == GLFW_KEY_D) state->depthEnabled = !state->depthEnabled;
     if (key == GLFW_KEY_R) {
         state->yaw = 0.0f;
         state->pitch = 0.05f;
@@ -202,13 +230,32 @@ cv::Mat makeSyntheticFrame(double t) {
     return frame;
 }
 
-std::vector<Instance> frameToVoxels(const cv::Mat& bgrSmall, const cv::Mat& flow) {
+cv::Mat luminanceFallbackNearness(const cv::Mat& bgrSmall) {
+    cv::Mat gray;
+    cv::cvtColor(bgrSmall, gray, cv::COLOR_BGR2GRAY);
+    cv::Mat nearness;
+    gray.convertTo(nearness, CV_32F, 1.0 / 255.0);
+    return nearness;
+}
+
+std::vector<Instance> frameToVoxels(
+    const cv::Mat& bgrSmall,
+    const cv::Mat& flow,
+    const cv::Mat& nearness) {
+
     std::vector<Instance> instances;
     instances.reserve(static_cast<size_t>(kGridW * kGridH));
+
+    const float halfW = static_cast<float>(kGridW - 1) * 0.5f;
+    const float halfH = static_cast<float>(kGridH - 1) * 0.5f;
+    const float fovRadians = kVirtualCameraFovDegrees * kPi / 180.0f;
+    const float focalPixels = (0.5f * static_cast<float>(kGridW)) / std::tan(fovRadians * 0.5f);
+    const float depthMidpoint = (kNearDistance + kFarDistance) * 0.5f;
 
     for (int y = 0; y < kGridH; ++y) {
         const auto* pixels = bgrSmall.ptr<cv::Vec3b>(y);
         const cv::Point2f* flowRow = flow.empty() ? nullptr : flow.ptr<cv::Point2f>(y);
+        const float* depthRow = nearness.empty() ? nullptr : nearness.ptr<float>(y);
 
         for (int x = 0; x < kGridW; ++x) {
             const cv::Vec3b bgr = pixels[x];
@@ -217,17 +264,28 @@ std::vector<Instance> frameToVoxels(const cv::Mat& bgrSmall, const cv::Mat& flow
                 static_cast<float>(bgr[1]) / 255.0f,
                 static_cast<float>(bgr[0]) / 255.0f);
 
-            const float luminance = glm::dot(colour, glm::vec3(0.2126f, 0.7152f, 0.0722f));
             float motion = 0.0f;
             if (flowRow) {
                 const cv::Point2f f = flowRow[x];
                 motion = std::clamp(std::sqrt(f.x * f.x + f.y * f.y) * 0.22f, 0.0f, 1.0f);
             }
 
-            const float worldX = (static_cast<float>(x) - (kGridW - 1) * 0.5f) * kVoxelSpacing;
-            const float worldY = ((kGridH - 1) * 0.5f - static_cast<float>(y)) * kVoxelSpacing;
-            const float worldZ = (luminance - 0.5f) * 1.8f + motion * 0.20f;
-            const float scale = 0.070f + motion * 0.025f;
+            const float nearValue = depthRow ? std::clamp(depthRow[x], 0.0f, 1.0f) : 0.5f;
+            const float distance = kFarDistance - nearValue * (kFarDistance - kNearDistance);
+
+            // Pinhole back-projection. MiDaS gives relative rather than metric depth,
+            // but perspective geometry is now spatial: nearby pixels spread less in
+            // camera-space depth than distant pixels instead of merely warping a plane.
+            float worldX = ((static_cast<float>(x) - halfW) / focalPixels) * distance;
+            float worldY = ((halfH - static_cast<float>(y)) / focalPixels) * distance;
+            float worldZ = -(distance - depthMidpoint);
+
+            worldX = quantise(worldX, kVoxelQuantisation);
+            worldY = quantise(worldY, kVoxelQuantisation);
+            worldZ = quantise(worldZ, kVoxelQuantisation);
+
+            const float distance01 = (distance - kNearDistance) / (kFarDistance - kNearDistance);
+            const float scale = 0.045f + distance01 * 0.030f + motion * 0.015f;
 
             instances.push_back({
                 glm::vec4(worldX, worldY, worldZ, scale),
@@ -240,7 +298,7 @@ std::vector<Instance> frameToVoxels(const cv::Mat& bgrSmall, const cv::Mat& flow
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         if (!glfwInit()) {
             throw std::runtime_error("GLFW initialisation failed");
@@ -253,7 +311,7 @@ int main() {
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-        GLFWwindow* window = glfwCreateWindow(1280, 720, "FlyVoxelisedReality | M0", nullptr, nullptr);
+        GLFWwindow* window = glfwCreateWindow(1280, 720, "FlyVoxelisedReality | M1", nullptr, nullptr);
         if (!window) {
             glfwTerminate();
             throw std::runtime_error("Could not create GLFW window");
@@ -285,6 +343,14 @@ int main() {
 
         std::cout << "OpenGL: " << glGetString(GL_VERSION) << '\n';
         std::cout << "GPU:    " << glGetString(GL_RENDERER) << '\n';
+
+        const std::string depthModelPath = resolveDepthModelPath(argc, argv);
+        DepthEstimator depthEstimator(depthModelPath);
+        std::cout << "Depth:  " << depthEstimator.status() << '\n';
+        if (!depthEstimator.available()) {
+            std::cout << "        Run scripts/download_depth_model.ps1, then restart for M1 depth.\n";
+        }
+        std::cout << "Keys:   D depth/fallback | Space pause | R reset view | drag orbit | wheel zoom\n";
 
         const GLuint program = createProgram();
 
@@ -347,8 +413,10 @@ int main() {
         cv::Mat gray;
         cv::Mat previousGray;
         cv::Mat flow;
+        cv::Mat depthNearness;
         std::vector<Instance> instances;
 
+        int capturedFrameIndex = 0;
         double titleAccumulator = 0.0;
         int titleFrames = 0;
         auto previousTime = std::chrono::steady_clock::now();
@@ -378,13 +446,28 @@ int main() {
                 }
                 gray.copyTo(previousGray);
 
-                instances = frameToVoxels(small, flow);
+                if (state.depthEnabled && depthEstimator.available()) {
+                    if (depthNearness.empty() || (capturedFrameIndex % kDepthInferenceInterval) == 0) {
+                        cv::Mat inferred = depthEstimator.inferNearness(frame, cv::Size(kGridW, kGridH));
+                        if (!inferred.empty()) depthNearness = inferred;
+                    }
+                } else {
+                    depthNearness = luminanceFallbackNearness(small);
+                }
+
+                if (depthNearness.empty()) {
+                    depthNearness = luminanceFallbackNearness(small);
+                }
+
+                instances = frameToVoxels(small, flow, depthNearness);
                 glBindBuffer(GL_ARRAY_BUFFER, instanceVbo);
                 glBufferSubData(
                     GL_ARRAY_BUFFER,
                     0,
                     static_cast<GLsizeiptr>(instances.size() * sizeof(Instance)),
                     instances.data());
+
+                ++capturedFrameIndex;
             }
 
             const float cp = std::cos(state.pitch);
@@ -412,9 +495,16 @@ int main() {
             ++titleFrames;
             if (titleAccumulator >= 0.5) {
                 const double fps = static_cast<double>(titleFrames) / titleAccumulator;
+                const bool realDepth = state.depthEnabled && depthEstimator.available();
+                std::string depthLabel = realDepth ? "DEPTH" : "FALLBACK";
+                if (realDepth) {
+                    depthLabel += " " + std::to_string(static_cast<int>(depthEstimator.lastInferenceMs())) + "ms";
+                }
+
                 const std::string title =
-                    "FlyVoxelisedReality | M0 | " + std::to_string(static_cast<int>(fps)) +
-                    " FPS | " + std::to_string(instances.size()) + " voxels" +
+                    "FlyVoxelisedReality | M1 " + depthLabel + " | " +
+                    std::to_string(static_cast<int>(fps)) + " FPS | " +
+                    std::to_string(instances.size()) + " voxels" +
                     (state.paused ? " | PAUSED" : "");
                 glfwSetWindowTitle(window, title.c_str());
                 titleAccumulator = 0.0;
