@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(OpenGL REQUIRED)
-find_package(glad CONFIG REQUIRED)
+find_package(GLEW REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc video videoio)
@@ -17,7 +17,7 @@ add_executable(FlyVoxelisedReality
 
 target_link_libraries(FlyVoxelisedReality PRIVATE
     OpenGL::GL
-    glad::glad
+    GLEW::GLEW
     glfw
     glm::glm
     ${OpenCV_LIBS}
