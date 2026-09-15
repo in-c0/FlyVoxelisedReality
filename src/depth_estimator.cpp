@@ -5,8 +5,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <filesystem>
-#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -61,7 +61,7 @@ DepthEstimator::DepthEstimator(const std::string& modelPath) {
             return;
         }
 
-        // CPU is the most portable v0 target. We can switch to a GPU backend
+        // CPU is the most portable M1 target. We can switch to a GPU backend
         // later without changing the renderer/data interface.
         net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
         net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
