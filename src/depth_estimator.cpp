@@ -13,10 +13,6 @@
 namespace {
 
 constexpr int kInputSize = 256;
-constexpr int kMedianKernel = 3;
-constexpr int kBilateralDiameter = 5;
-constexpr double kBilateralSigmaDepth = 0.055;
-constexpr double kBilateralSigmaSpace = 2.0;
 
 float percentile(std::vector<float> values, float p) {
     if (values.empty()) return 0.0f;
@@ -48,55 +44,6 @@ cv::Mat predictionTo2D(const cv::Mat& prediction) {
     }
 
     throw std::runtime_error("Unexpected MiDaS output rank: " + std::to_string(prediction.dims));
-}
-
-cv::Mat cleanSpatialDepth(const cv::Mat& nearness) {
-    if (nearness.empty()) return {};
-
-    // Remove small isolated spikes before they become detached voxel islands.
-    cv::Mat medianFiltered;
-    cv::medianBlur(nearness, medianFiltered, kMedianKernel);
-
-    // Smooth noise within surfaces while keeping strong object boundaries sharp.
-    cv::Mat edgeAware;
-    cv::bilateralFilter(
-        medianFiltered,
-        edgeAware,
-        kBilateralDiameter,
-        kBilateralSigmaDepth,
-        kBilateralSigmaSpace,
-        cv::BORDER_REPLICATE);
-
-    return edgeAware;
-}
-
-void temporalStabilise(const cv::Mat& current, cv::Mat& history) {
-    if (current.empty()) return;
-
-    if (history.empty() || history.size() != current.size() || history.type() != current.type()) {
-        history = current.clone();
-        return;
-    }
-
-    // Stable surfaces get strong temporal smoothing. Large depth changes update
-    // quickly so moving hands and silhouette edges do not leave long ghost trails.
-    for (int y = 0; y < current.rows; ++y) {
-        const float* src = current.ptr<float>(y);
-        float* dst = history.ptr<float>(y);
-
-        for (int x = 0; x < current.cols; ++x) {
-            const float delta = std::abs(src[x] - dst[x]);
-
-            float newWeight = 0.32f;
-            if (delta > 0.18f) {
-                newWeight = 0.90f;
-            } else if (delta > 0.075f) {
-                newWeight = 0.62f;
-            }
-
-            dst[x] = dst[x] * (1.0f - newWeight) + src[x] * newWeight;
-        }
-    }
 }
 
 } // namespace
@@ -178,18 +125,20 @@ cv::Mat DepthEstimator::inferNearness(const cv::Mat& bgrFrame, cv::Size outputSi
             }
         }
 
-        // Clean at the network resolution before collapsing to the coarse voxel
-        // grid, where one bad depth sample would otherwise become a large cube.
-        cv::Mat cleaned = cleanSpatialDepth(nearness);
-
         cv::Mat output;
-        cv::resize(cleaned, output, outputSize, 0.0, 0.0, cv::INTER_AREA);
+        cv::resize(nearness, output, outputSize, 0.0, 0.0, cv::INTER_CUBIC);
 
-        temporalStabilise(output, smoothedNearness_);
+        // MiDaS relative depth changes slightly frame to frame. Temporal smoothing
+        // makes the voxel surface readable without hiding large scene motion.
+        if (smoothedNearness_.empty() || smoothedNearness_.size() != output.size()) {
+            smoothedNearness_ = output.clone();
+        } else {
+            cv::addWeighted(output, 0.40, smoothedNearness_, 0.60, 0.0, smoothedNearness_);
+        }
 
         const auto end = std::chrono::steady_clock::now();
         lastInferenceMs_ = std::chrono::duration<double, std::milli>(end - start).count();
-        status_ = "MiDaS relative depth active + edge cleanup";
+        status_ = "MiDaS relative depth active";
         return smoothedNearness_.clone();
     } catch (const cv::Exception& e) {
         status_ = std::string("depth inference failed: ") + e.what();
