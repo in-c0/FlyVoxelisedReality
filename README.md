@@ -20,7 +20,7 @@ OpenGL instanced rendering
 
 M0 has been validated on Windows with an RTX 2080 and a live webcam.
 
-### M1 — monocular relative depth → spatial voxel reconstruction 🚧
+### M1 — monocular relative depth → spatial voxel reconstruction ✅
 
 M1 replaces the original brightness-as-depth experiment with a real monocular depth network:
 
@@ -38,9 +38,34 @@ quantised 3D voxel positions
 OpenGL instanced rendering
 ```
 
+M1 has been locally validated with a live webcam. Foreground human geometry and room background separate spatially in the reconstructed voxel field.
+
 Important: MiDaS provides **relative monocular depth**, not calibrated metric distance in metres. The resulting scene has real depth ordering and perspective structure, but it is not yet an accurate metric scan of the room.
 
-Optical flow still runs alongside depth and is visualised as cyan/green activity on moving voxels.
+Optical flow runs alongside depth and is visualised as cyan/green activity on moving voxels.
+
+### M2 — fly-inspired perception renderer 🚧
+
+M2 adds a second OpenGL render stage:
+
+```text
+voxel scene
+   ↓
+off-screen framebuffer (colour + depth)
+   ↓
+full-screen GLSL perception pass
+   ↓
+staggered ommatidial sampling + wide FOV + visible-spectrum remap
+```
+
+Press `F` to toggle between:
+
+- **RESEARCHER** — conventional OpenGL view
+- **FLY** — fly-inspired compound-eye preview
+
+The fly view is deliberately labelled **fly-inspired**, not biologically exact. A normal webcam does not capture ultraviolet light and the current renderer does not model individual Drosophila photoreceptor classes or retinal neural processing. The colour transform is therefore only a visible-RGB proxy, while the staggered lens field is a graphics representation of compound-eye angular sampling.
+
+This renderer is intended to become the visual front end for M3, where real-time motion/features will drive a mapped Drosophila visual pathway.
 
 ## Planned full pipeline
 
@@ -68,6 +93,7 @@ NEURAL APPEARANCE
 - `Esc` — quit
 - `Space` — pause/resume camera-driven voxel updates
 - `D` — toggle monocular depth vs the old brightness fallback
+- `F` — toggle researcher vs fly-inspired perception
 - `R` — reset camera orbit
 - Drag with **left mouse** — orbit around the reconstructed scene
 - Mouse wheel — zoom
@@ -137,8 +163,8 @@ You can also supply a model path explicitly:
 
 - [x] Repository + architecture scaffold
 - [x] **M0:** webcam → OpenCV → live OpenGL voxel field
-- [ ] **M1:** relative monocular depth → spatial voxel reconstruction (implemented; awaiting local validation)
-- [ ] **M2:** fly-inspired compound-eye / motion perception
+- [x] **M1:** relative monocular depth → spatial voxel reconstruction
+- [ ] **M2:** fly-inspired compound-eye / motion perception (implemented; awaiting local validation)
 - [ ] **M3:** real Drosophila visual-pathway map + live activation
 - [ ] **M4:** researcher ↔ fly dual perspective
 - [ ] **M5:** bounded neural-rendering experiment
