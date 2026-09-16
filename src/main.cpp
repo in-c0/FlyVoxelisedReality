@@ -1,4 +1,5 @@
 #include "depth_estimator.hpp"
+#include "preset_scenes.hpp"
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -26,7 +27,7 @@ namespace {
 constexpr int kGridW = 48;
 constexpr int kGridH = 36;
 constexpr int kDepthInferenceInterval = 2;
-constexpr int kExtraInstanceCapacity = 16;
+constexpr int kMaxInstances = 20000;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kVirtualCameraFovDegrees = 68.0f;
 constexpr float kNearDistance = 0.75f;
@@ -41,6 +42,7 @@ struct Instance {
 struct AppState {
     int framebufferW = 1280;
     int framebufferH = 720;
+    int sceneMode = 1; // 1 office, 2 kitchen, 3 live CV
     bool paused = false;
     bool dragging = false;
     bool depthEnabled = true;
@@ -49,7 +51,7 @@ struct AppState {
     double lastMouseY = 0.0;
     float yaw = 0.0f;
     float pitch = 0.05f;
-    float distance = 7.2f;
+    float distance = 8.6f;
 };
 
 struct VisualStimulus {
@@ -99,7 +101,6 @@ glm::vec3 backProjectGridPoint(float x, float y, float nearValue) {
     const float fovRadians = kVirtualCameraFovDegrees * kPi / 180.0f;
     const float focalPixels = (0.5f * static_cast<float>(kGridW)) / std::tan(fovRadians * 0.5f);
     const float depthMidpoint = (kNearDistance + kFarDistance) * 0.5f;
-
     const float distance = kFarDistance - std::clamp(nearValue, 0.0f, 1.0f) * (kFarDistance - kNearDistance);
 
     return {
@@ -213,10 +214,13 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     if (key == GLFW_KEY_SPACE) state->paused = !state->paused;
     if (key == GLFW_KEY_D) state->depthEnabled = !state->depthEnabled;
     if (key == GLFW_KEY_A) state->agentEnabled = !state->agentEnabled;
+    if (key == GLFW_KEY_1) state->sceneMode = 1;
+    if (key == GLFW_KEY_2) state->sceneMode = 2;
+    if (key == GLFW_KEY_3) state->sceneMode = 3;
     if (key == GLFW_KEY_R) {
         state->yaw = 0.0f;
         state->pitch = 0.05f;
-        state->distance = 7.2f;
+        state->distance = state->sceneMode == 3 ? 7.2f : 8.6f;
     }
 }
 
@@ -250,7 +254,7 @@ void cursorPositionCallback(GLFWwindow* window, double x, double y) {
 void scrollCallback(GLFWwindow* window, double, double yoffset) {
     auto* state = static_cast<AppState*>(glfwGetWindowUserPointer(window));
     if (!state) return;
-    state->distance = std::clamp(state->distance - static_cast<float>(yoffset) * 0.45f, 2.4f, 16.0f);
+    state->distance = std::clamp(state->distance - static_cast<float>(yoffset) * 0.45f, 2.4f, 18.0f);
 }
 
 cv::Mat makeSyntheticFrame(double t) {
@@ -285,7 +289,7 @@ std::vector<Instance> frameToVoxels(
     const cv::Mat& nearness) {
 
     std::vector<Instance> instances;
-    instances.reserve(static_cast<size_t>(kGridW * kGridH + kExtraInstanceCapacity));
+    instances.reserve(static_cast<size_t>(kGridW * kGridH + 16));
 
     for (int y = 0; y < kGridH; ++y) {
         const auto* pixels = bgrSmall.ptr<cv::Vec3b>(y);
@@ -314,11 +318,19 @@ std::vector<Instance> frameToVoxels(
             const float distance = kFarDistance - std::clamp(nearValue, 0.0f, 1.0f) * (kFarDistance - kNearDistance);
             const float distance01 = (distance - kNearDistance) / (kFarDistance - kNearDistance);
             const float scale = 0.045f + distance01 * 0.030f + motion * 0.015f;
-
             instances.push_back({glm::vec4(world, scale), glm::vec4(colour, motion)});
         }
     }
 
+    return instances;
+}
+
+std::vector<Instance> presetToInstances(const PresetScene& scene) {
+    std::vector<Instance> instances;
+    instances.reserve(scene.voxels.size() + 16);
+    for (const SceneVoxel& voxel : scene.voxels) {
+        instances.push_back({glm::vec4(voxel.position, voxel.scale), glm::vec4(voxel.colour, 0.0f)});
+    }
     return instances;
 }
 
@@ -366,6 +378,21 @@ VisualStimulus extractVisualStimulus(const cv::Mat& flow, const cv::Mat& nearnes
     return stimulus;
 }
 
+VisualStimulus makePresetStimulus(const PresetScene& scene, double elapsed, int sceneMode) {
+    VisualStimulus stimulus;
+    const float t = static_cast<float>(elapsed);
+    const float phase = sceneMode == 1 ? 0.0f : 1.2f;
+    const float lateral = std::sin(t * 0.75f + phase) * 0.85f;
+    const float vertical = std::sin(t * 1.15f + phase) * 0.20f;
+
+    stimulus.valid = true;
+    stimulus.activity = 0.38f + 0.22f * (0.5f + 0.5f * std::sin(t * 1.7f));
+    stimulus.leftMotion = lateral < 0.0f ? stimulus.activity : 0.0f;
+    stimulus.rightMotion = lateral >= 0.0f ? stimulus.activity : 0.0f;
+    stimulus.worldTarget = scene.stimulusAnchor + glm::vec3(lateral, vertical, 0.35f * std::cos(t * 0.55f));
+    return stimulus;
+}
+
 void updateFlyAgent(FlyAgent& fly, const VisualStimulus& stimulus, float dt, bool enabled) {
     fly.retina = smoothToward(fly.retina, stimulus.activity, 12.0f, dt);
     fly.lamina = smoothToward(fly.lamina, fly.retina, 8.0f, dt);
@@ -382,15 +409,13 @@ void updateFlyAgent(FlyAgent& fly, const VisualStimulus& stimulus, float dt, boo
     const float turnT = std::clamp(dt * (1.5f + 4.0f * fly.lobula), 0.0f, 1.0f);
     fly.forward = glm::normalize(fly.forward * (1.0f - turnT) + desiredDirection * turnT);
 
-    // This movement is intentionally an engineering proxy for M2, not a claim
-    // about a specific Drosophila behavioural policy. M3 will replace the proxy
-    // pathway with connectivity grounded in a real visual-neural map.
+    // Engineering proxy only. M3 replaces this with connectivity grounded in a
+    // real Drosophila visual-neural map rather than claiming biological fidelity.
     const float speed = 0.10f + 0.85f * fly.lobula;
     fly.position += fly.forward * std::min(speed * dt, distance * 0.18f);
-
     fly.position.x = std::clamp(fly.position.x, -4.0f, 4.0f);
     fly.position.y = std::clamp(fly.position.y, -3.0f, 3.0f);
-    fly.position.z = std::clamp(fly.position.z, -2.5f, 2.8f);
+    fly.position.z = std::clamp(fly.position.z, -2.8f, 3.0f);
 }
 
 void appendFlyInstances(std::vector<Instance>& instances, const FlyAgent& fly) {
@@ -420,6 +445,24 @@ void appendFlyInstances(std::vector<Instance>& instances, const FlyAgent& fly) {
     }
 }
 
+void appendStimulusProbe(std::vector<Instance>& instances, const VisualStimulus& stimulus) {
+    if (!stimulus.valid) return;
+    const glm::vec3 colour(0.95f, 0.48f, 0.08f);
+    instances.push_back({glm::vec4(stimulus.worldTarget, 0.09f), glm::vec4(colour, stimulus.activity)});
+}
+
+void resetFlyForMode(FlyAgent& fly, int sceneMode, const PresetScene& office, const PresetScene& kitchen) {
+    fly = FlyAgent{};
+    if (sceneMode == 1) fly.position = office.flyStart;
+    else if (sceneMode == 2) fly.position = kitchen.flyStart;
+}
+
+const char* sceneModeName(int sceneMode) {
+    if (sceneMode == 1) return "OFFICE";
+    if (sceneMode == 2) return "KITCHEN";
+    return "LIVE CV";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -433,7 +476,7 @@ int main(int argc, char** argv) {
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-        GLFWwindow* window = glfwCreateWindow(1280, 720, "FlyVoxelisedReality | M2 AGENT", nullptr, nullptr);
+        GLFWwindow* window = glfwCreateWindow(1280, 720, "FlyVoxelisedReality | PRESET SCENES", nullptr, nullptr);
         if (!window) {
             glfwTerminate();
             throw std::runtime_error("Could not create GLFW window");
@@ -464,28 +507,34 @@ int main(int argc, char** argv) {
         std::cout << "OpenGL: " << glGetString(GL_VERSION) << '\n';
         std::cout << "GPU:    " << glGetString(GL_RENDERER) << '\n';
 
+        const PresetScene office = makeOfficeScene();
+        const PresetScene kitchen = makeKitchenScene();
+        std::cout << "Scenes: 1 Office / Studio (" << office.voxels.size() << " voxels)\n";
+        std::cout << "        2 Kitchen / Fruit Table (" << kitchen.voxels.size() << " voxels)\n";
+        std::cout << "        3 Live Camera Reconstruction\n";
+
         const std::string depthModelPath = resolveDepthModelPath(argc, argv);
         DepthEstimator depthEstimator(depthModelPath);
         std::cout << "Depth:  " << depthEstimator.status() << '\n';
-        if (!depthEstimator.available()) std::cout << "        Run scripts/download_depth_model.ps1, then restart for M1 depth.\n";
-        std::cout << "M2:     realtime motion stimulus -> retina -> lamina -> medulla -> lobula -> prototype steering\n";
-        std::cout << "Keys:   A agent on/off | D depth/fallback | Space pause | R reset view | drag orbit | wheel zoom\n";
+        if (!depthEstimator.available()) std::cout << "        Run scripts/download_depth_model.ps1, then restart for live depth.\n";
+        std::cout << "M2:     stimulus -> retina -> lamina -> medulla -> lobula -> prototype steering\n";
+        std::cout << "Keys:   1 office | 2 kitchen | 3 live CV | A agent | D depth | Space pause | R reset\n";
 
         const GLuint program = createProgram();
 
         static constexpr float cubeVertices[] = {
-            -1,-1,-1,  0, 0,-1,   1, 1,-1,  0, 0,-1,   1,-1,-1,  0, 0,-1,
-             1, 1,-1,  0, 0,-1,  -1,-1,-1,  0, 0,-1,  -1, 1,-1,  0, 0,-1,
-            -1,-1, 1,  0, 0, 1,   1,-1, 1,  0, 0, 1,   1, 1, 1,  0, 0, 1,
-             1, 1, 1,  0, 0, 1,  -1, 1, 1,  0, 0, 1,  -1,-1, 1,  0, 0, 1,
-            -1, 1, 1, -1, 0, 0,  -1, 1,-1, -1, 0, 0,  -1,-1,-1, -1, 0, 0,
-            -1,-1,-1, -1, 0, 0,  -1,-1, 1, -1, 0, 0,  -1, 1, 1, -1, 0, 0,
-             1, 1, 1,  1, 0, 0,   1,-1,-1,  1,0,0,     1,1,-1,   1,0,0,
-             1,-1,-1,  1,0,0,     1,1,1,     1,0,0,     1,-1,1,   1,0,0,
-            -1,-1,-1,  0,-1,0,    1,-1,-1,   0,-1,0,    1,-1,1,   0,-1,0,
-             1,-1,1,   0,-1,0,   -1,-1,1,    0,-1,0,   -1,-1,-1, 0,-1,0,
-            -1,1,-1,   0,1,0,     1,1,1,      0,1,0,     1,1,-1,   0,1,0,
-             1,1,1,    0,1,0,    -1,1,-1,     0,1,0,    -1,1,1,    0,1,0
+            -1,-1,-1,  0,0,-1,   1,1,-1,  0,0,-1,   1,-1,-1,  0,0,-1,
+             1,1,-1,   0,0,-1,  -1,-1,-1, 0,0,-1,  -1,1,-1,   0,0,-1,
+            -1,-1,1,   0,0,1,    1,-1,1,  0,0,1,    1,1,1,    0,0,1,
+             1,1,1,    0,0,1,   -1,1,1,   0,0,1,   -1,-1,1,   0,0,1,
+            -1,1,1,   -1,0,0,   -1,1,-1, -1,0,0,   -1,-1,-1, -1,0,0,
+            -1,-1,-1, -1,0,0,   -1,-1,1, -1,0,0,   -1,1,1,   -1,0,0,
+             1,1,1,    1,0,0,    1,-1,-1, 1,0,0,    1,1,-1,    1,0,0,
+             1,-1,-1,  1,0,0,    1,1,1,   1,0,0,    1,-1,1,    1,0,0,
+            -1,-1,-1,  0,-1,0,   1,-1,-1, 0,-1,0,   1,-1,1,    0,-1,0,
+             1,-1,1,   0,-1,0,  -1,-1,1,  0,-1,0,  -1,-1,-1,  0,-1,0,
+            -1,1,-1,   0,1,0,    1,1,1,   0,1,0,    1,1,-1,    0,1,0,
+             1,1,1,    0,1,0,   -1,1,-1,  0,1,0,   -1,1,1,     0,1,0
         };
 
         GLuint vao = 0;
@@ -504,7 +553,7 @@ int main(int argc, char** argv) {
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
 
         glBindBuffer(GL_ARRAY_BUFFER, instanceVbo);
-        glBufferData(GL_ARRAY_BUFFER, (kGridW * kGridH + kExtraInstanceCapacity) * sizeof(Instance), nullptr, GL_STREAM_DRAW);
+        glBufferData(GL_ARRAY_BUFFER, kMaxInstances * sizeof(Instance), nullptr, GL_STREAM_DRAW);
         glEnableVertexAttribArray(2);
         glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, sizeof(Instance), nullptr);
         glVertexAttribDivisor(2, 1);
@@ -521,9 +570,9 @@ int main(int argc, char** argv) {
             capture.set(cv::CAP_PROP_FRAME_WIDTH, 640);
             capture.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
             capture.set(cv::CAP_PROP_FPS, 30);
-            std::cout << "Camera: live webcam input\n";
+            std::cout << "Camera: live webcam input ready for mode 3\n";
         } else {
-            std::cerr << "Camera unavailable; using synthetic fallback input.\n";
+            std::cerr << "Camera unavailable; mode 3 will use synthetic fallback input.\n";
         }
 
         cv::Mat frame;
@@ -535,7 +584,9 @@ int main(int argc, char** argv) {
         std::vector<Instance> instances;
         FlyAgent fly;
         VisualStimulus stimulus;
+        resetFlyForMode(fly, state.sceneMode, office, kitchen);
 
+        int activeSceneMode = state.sceneMode;
         int capturedFrameIndex = 0;
         double titleAccumulator = 0.0;
         int titleFrames = 0;
@@ -550,39 +601,57 @@ int main(int argc, char** argv) {
             previousTime = now;
             const double elapsed = std::chrono::duration<double>(now - startTime).count();
 
+            if (activeSceneMode != state.sceneMode) {
+                activeSceneMode = state.sceneMode;
+                resetFlyForMode(fly, activeSceneMode, office, kitchen);
+                stimulus = VisualStimulus{};
+                previousGray.release();
+                flow.release();
+                state.distance = activeSceneMode == 3 ? 7.2f : 8.6f;
+            }
+
             if (!state.paused) {
-                bool gotFrame = false;
-                if (capture.isOpened()) gotFrame = capture.read(frame);
-                if (!gotFrame) frame = makeSyntheticFrame(elapsed);
-                else cv::flip(frame, frame, 1);
+                if (state.sceneMode == 3) {
+                    bool gotFrame = false;
+                    if (capture.isOpened()) gotFrame = capture.read(frame);
+                    if (!gotFrame) frame = makeSyntheticFrame(elapsed);
+                    else cv::flip(frame, frame, 1);
 
-                cv::resize(frame, small, cv::Size(kGridW, kGridH), 0.0, 0.0, cv::INTER_AREA);
-                cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
+                    cv::resize(frame, small, cv::Size(kGridW, kGridH), 0.0, 0.0, cv::INTER_AREA);
+                    cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
+                    if (!previousGray.empty()) cv::calcOpticalFlowFarneback(previousGray, gray, flow, 0.5, 3, 9, 2, 5, 1.1, 0);
+                    else flow = cv::Mat::zeros(gray.size(), CV_32FC2);
+                    gray.copyTo(previousGray);
 
-                if (!previousGray.empty()) cv::calcOpticalFlowFarneback(previousGray, gray, flow, 0.5, 3, 9, 2, 5, 1.1, 0);
-                else flow = cv::Mat::zeros(gray.size(), CV_32FC2);
-                gray.copyTo(previousGray);
-
-                if (state.depthEnabled && depthEstimator.available()) {
-                    if (depthNearness.empty() || (capturedFrameIndex % kDepthInferenceInterval) == 0) {
-                        cv::Mat inferred = depthEstimator.inferNearness(frame, cv::Size(kGridW, kGridH));
-                        if (!inferred.empty()) depthNearness = inferred;
+                    if (state.depthEnabled && depthEstimator.available()) {
+                        if (depthNearness.empty() || (capturedFrameIndex % kDepthInferenceInterval) == 0) {
+                            cv::Mat inferred = depthEstimator.inferNearness(frame, cv::Size(kGridW, kGridH));
+                            if (!inferred.empty()) depthNearness = inferred;
+                        }
+                    } else {
+                        depthNearness = luminanceFallbackNearness(small);
                     }
+                    if (depthNearness.empty()) depthNearness = luminanceFallbackNearness(small);
+
+                    stimulus = extractVisualStimulus(flow, depthNearness);
+                    instances = frameToVoxels(small, flow, depthNearness);
+                    ++capturedFrameIndex;
                 } else {
-                    depthNearness = luminanceFallbackNearness(small);
+                    const PresetScene& scene = state.sceneMode == 1 ? office : kitchen;
+                    stimulus = makePresetStimulus(scene, elapsed, state.sceneMode);
+                    instances = presetToInstances(scene);
+                    appendStimulusProbe(instances, stimulus);
                 }
 
-                if (depthNearness.empty()) depthNearness = luminanceFallbackNearness(small);
-
-                stimulus = extractVisualStimulus(flow, depthNearness);
                 updateFlyAgent(fly, stimulus, dt, state.agentEnabled);
-
-                instances = frameToVoxels(small, flow, depthNearness);
                 appendFlyInstances(instances, fly);
+
+                if (instances.size() > static_cast<size_t>(kMaxInstances)) {
+                    throw std::runtime_error("Scene exceeded kMaxInstances");
+                }
 
                 glBindBuffer(GL_ARRAY_BUFFER, instanceVbo);
                 glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(instances.size() * sizeof(Instance)), instances.data());
-                ++capturedFrameIndex;
             }
 
             const float cp = std::cos(state.pitch);
@@ -591,7 +660,11 @@ int main(int argc, char** argv) {
                 state.distance * std::sin(state.pitch),
                 state.distance * cp * std::cos(state.yaw));
 
-            const glm::mat4 view = glm::lookAt(cameraPosition, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+            glm::vec3 lookTarget(0.0f);
+            if (state.sceneMode == 1) lookTarget = office.focusTarget;
+            else if (state.sceneMode == 2) lookTarget = kitchen.focusTarget;
+
+            const glm::mat4 view = glm::lookAt(cameraPosition, lookTarget, glm::vec3(0.0f, 1.0f, 0.0f));
             const float aspect = static_cast<float>(state.framebufferW) / static_cast<float>(std::max(state.framebufferH, 1));
             const glm::mat4 projection = glm::perspective(45.0f * kPi / 180.0f, aspect, 0.05f, 100.0f);
 
@@ -608,15 +681,20 @@ int main(int argc, char** argv) {
             ++titleFrames;
             if (titleAccumulator >= 0.5) {
                 const double fps = static_cast<double>(titleFrames) / titleAccumulator;
-                const bool realDepth = state.depthEnabled && depthEstimator.available();
-                std::string depthLabel = realDepth ? "DEPTH" : "FALLBACK";
-                if (realDepth) depthLabel += " " + std::to_string(static_cast<int>(depthEstimator.lastInferenceMs())) + "ms";
-
                 const int stimulusPercent = static_cast<int>(std::round(stimulus.activity * 100.0f));
                 const int neuralPercent = static_cast<int>(std::round(fly.lobula * 100.0f));
+
+                std::string source = sceneModeName(state.sceneMode);
+                if (state.sceneMode == 3) {
+                    const bool realDepth = state.depthEnabled && depthEstimator.available();
+                    source += realDepth ? " DEPTH" : " FALLBACK";
+                    if (realDepth) source += " " + std::to_string(static_cast<int>(depthEstimator.lastInferenceMs())) + "ms";
+                }
+
                 const std::string title =
-                    "FlyVoxelisedReality | M2 AGENT | " + depthLabel + " | " +
-                    std::to_string(static_cast<int>(fps)) + " FPS | stimulus " +
+                    "FlyVoxelisedReality | " + source + " | " +
+                    std::to_string(static_cast<int>(fps)) + " FPS | " +
+                    std::to_string(instances.size()) + " voxels | stimulus " +
                     std::to_string(stimulusPercent) + "% | pathway " + std::to_string(neuralPercent) + "%" +
                     (state.agentEnabled ? "" : " | AGENT PAUSED") +
                     (state.paused ? " | PAUSED" : "");
