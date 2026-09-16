@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyVoxelisedReality VERSION 0.2.0 LANGUAGES CXX)
+project(FlyVoxelisedReality VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,6 +14,7 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc video videoio dnn)
 add_executable(FlyVoxelisedReality
     src/main.cpp
     src/depth_estimator.cpp
+    src/preset_scenes.cpp
 )
 
 target_link_libraries(FlyVoxelisedReality PRIVATE
