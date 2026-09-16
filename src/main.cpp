@@ -28,6 +28,8 @@ constexpr int kGridH = 36;
 constexpr int kDepthInferenceInterval = 2;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kVirtualCameraFovDegrees = 68.0f;
+constexpr float kResearcherFovDegrees = 45.0f;
+constexpr float kFlyPreviewFovDegrees = 100.0f;
 constexpr float kNearDistance = 0.75f;
 constexpr float kFarDistance = 4.50f;
 constexpr float kVoxelQuantisation = 0.075f;
@@ -43,11 +45,20 @@ struct AppState {
     bool paused = false;
     bool dragging = false;
     bool depthEnabled = true;
+    bool flyVisionEnabled = false;
     double lastMouseX = 0.0;
     double lastMouseY = 0.0;
     float yaw = 0.0f;
     float pitch = 0.05f;
     float distance = 7.2f;
+};
+
+struct RenderTarget {
+    GLuint framebuffer = 0;
+    GLuint colourTexture = 0;
+    GLuint depthStencil = 0;
+    int width = 0;
+    int height = 0;
 };
 
 float quantise(float value, float step) {
@@ -87,7 +98,26 @@ GLuint compileShader(GLenum type, const char* source) {
     return shader;
 }
 
-GLuint createProgram() {
+GLuint linkProgram(GLuint vertexShader, GLuint fragmentShader) {
+    const GLuint program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+
+    GLint ok = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        GLint length = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
+        std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
+        glGetProgramInfoLog(program, length, nullptr, log.data());
+        glDeleteProgram(program);
+        throw std::runtime_error("Program link failed:\n" + log);
+    }
+    return program;
+}
+
+GLuint createSceneProgram() {
     static constexpr const char* kVertexShader = R"GLSL(
 #version 330 core
 layout(location = 0) in vec3 aPosition;
@@ -135,24 +165,149 @@ void main() {
 
     const GLuint vs = compileShader(GL_VERTEX_SHADER, kVertexShader);
     const GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
-    const GLuint program = glCreateProgram();
-    glAttachShader(program, vs);
-    glAttachShader(program, fs);
-    glLinkProgram(program);
+    const GLuint program = linkProgram(vs, fs);
     glDeleteShader(vs);
     glDeleteShader(fs);
-
-    GLint ok = GL_FALSE;
-    glGetProgramiv(program, GL_LINK_STATUS, &ok);
-    if (ok != GL_TRUE) {
-        GLint length = 0;
-        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
-        std::string log(static_cast<size_t>(std::max(length, 1)), '\0');
-        glGetProgramInfoLog(program, length, nullptr, log.data());
-        glDeleteProgram(program);
-        throw std::runtime_error("Program link failed:\n" + log);
-    }
     return program;
+}
+
+GLuint createPerceptionProgram() {
+    static constexpr const char* kVertexShader = R"GLSL(
+#version 330 core
+out vec2 vUv;
+
+const vec2 kPositions[6] = vec2[](
+    vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2( 1.0,  1.0),
+    vec2(-1.0, -1.0), vec2( 1.0,  1.0), vec2(-1.0,  1.0)
+);
+
+void main() {
+    vec2 p = kPositions[gl_VertexID];
+    vUv = p * 0.5 + 0.5;
+    gl_Position = vec4(p, 0.0, 1.0);
+}
+)GLSL";
+
+    static constexpr const char* kFragmentShader = R"GLSL(
+#version 330 core
+in vec2 vUv;
+out vec4 FragColor;
+
+uniform sampler2D uScene;
+uniform vec2 uResolution;
+uniform int uFlyVision;
+
+vec3 flyInspiredColour(vec3 rgb) {
+    // A webcam has no UV channel, so this is deliberately only an RGB proxy:
+    // attenuate long-wavelength red and bias visible contrast toward green/blue.
+    float blueGreen = 0.58 * rgb.b + 0.42 * rgb.g;
+    float green = 0.82 * rgb.g + 0.18 * rgb.b;
+    float dimRed = 0.22 * rgb.r + 0.08 * rgb.g;
+    return vec3(dimRed, green, blueGreen);
+}
+
+void main() {
+    if (uFlyVision == 0) {
+        FragColor = texture(uScene, vUv);
+        return;
+    }
+
+    vec2 resolution = max(uResolution, vec2(1.0));
+    vec2 pixel = vUv * resolution;
+
+    // Rough ommatidial packing: staggered lens rows, sized from screen height so
+    // aspect ratio changes do not stretch the cells. This is a perceptual preview,
+    // not a claim of anatomically exact Drosophila optics.
+    float cellWidth = max(resolution.y / 23.0, 10.0);
+    float rowHeight = cellWidth * 0.8660254;
+    float row = floor(pixel.y / rowHeight);
+    float rowOffset = mod(row, 2.0) * cellWidth * 0.5;
+    float col = floor((pixel.x - rowOffset) / cellWidth);
+
+    vec2 centrePx = vec2(
+        (col + 0.5) * cellWidth + rowOffset,
+        (row + 0.5) * rowHeight
+    );
+
+    vec2 localPx = pixel - centrePx;
+    vec2 local = vec2(
+        localPx.x / (cellWidth * 0.52),
+        localPx.y / (rowHeight * 0.60)
+    );
+
+    float radius = length(local);
+    vec2 centreUv = centrePx / resolution;
+
+    // Sample a small portion of the image inside each lens rather than reducing
+    // every lens to one flat colour. This keeps motion readable while still making
+    // the angular sampling obvious.
+    vec2 lensOffset = vec2(
+        local.x * cellWidth,
+        local.y * rowHeight
+    ) / resolution * 0.16;
+    vec2 sampleUv = clamp(centreUv + lensOffset, vec2(0.0), vec2(1.0));
+
+    vec3 colour = texture(uScene, sampleUv).rgb;
+    colour = flyInspiredColour(colour);
+
+    // Lens curvature cue plus dark inter-ommatidial seams.
+    float lensShade = 1.08 - 0.20 * clamp(radius * radius, 0.0, 1.0);
+    colour *= lensShade;
+    float seam = smoothstep(0.82, 1.00, radius);
+    colour = mix(colour, vec3(0.006, 0.010, 0.012), seam);
+
+    FragColor = vec4(colour, 1.0);
+}
+)GLSL";
+
+    const GLuint vs = compileShader(GL_VERTEX_SHADER, kVertexShader);
+    const GLuint fs = compileShader(GL_FRAGMENT_SHADER, kFragmentShader);
+    const GLuint program = linkProgram(vs, fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    return program;
+}
+
+void destroyRenderTarget(RenderTarget& target) {
+    if (target.depthStencil != 0) glDeleteRenderbuffers(1, &target.depthStencil);
+    if (target.colourTexture != 0) glDeleteTextures(1, &target.colourTexture);
+    if (target.framebuffer != 0) glDeleteFramebuffers(1, &target.framebuffer);
+    target = {};
+}
+
+void ensureRenderTarget(RenderTarget& target, int width, int height) {
+    width = std::max(width, 1);
+    height = std::max(height, 1);
+    if (target.framebuffer != 0 && target.width == width && target.height == height) return;
+
+    destroyRenderTarget(target);
+
+    glGenFramebuffers(1, &target.framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+
+    glGenTextures(1, &target.colourTexture);
+    glBindTexture(GL_TEXTURE_2D, target.colourTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.colourTexture, 0);
+
+    glGenRenderbuffers(1, &target.depthStencil);
+    glBindRenderbuffer(GL_RENDERBUFFER, target.depthStencil);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, target.depthStencil);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        destroyRenderTarget(target);
+        throw std::runtime_error("Off-screen perception framebuffer is incomplete");
+    }
+
+    target.width = width;
+    target.height = height;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
@@ -172,6 +327,7 @@ void keyCallback(GLFWwindow* window, int key, int, int action, int) {
     if (key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, GLFW_TRUE);
     if (key == GLFW_KEY_SPACE) state->paused = !state->paused;
     if (key == GLFW_KEY_D) state->depthEnabled = !state->depthEnabled;
+    if (key == GLFW_KEY_F) state->flyVisionEnabled = !state->flyVisionEnabled;
     if (key == GLFW_KEY_R) {
         state->yaw = 0.0f;
         state->pitch = 0.05f;
@@ -273,9 +429,6 @@ std::vector<Instance> frameToVoxels(
             const float nearValue = depthRow ? std::clamp(depthRow[x], 0.0f, 1.0f) : 0.5f;
             const float distance = kFarDistance - nearValue * (kFarDistance - kNearDistance);
 
-            // Pinhole back-projection. MiDaS gives relative rather than metric depth,
-            // but perspective geometry is now spatial: nearby pixels spread less in
-            // camera-space depth than distant pixels instead of merely warping a plane.
             float worldX = ((static_cast<float>(x) - halfW) / focalPixels) * distance;
             float worldY = ((halfH - static_cast<float>(y)) / focalPixels) * distance;
             float worldZ = -(distance - depthMidpoint);
@@ -311,7 +464,7 @@ int main(int argc, char** argv) {
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-        GLFWwindow* window = glfwCreateWindow(1280, 720, "FlyVoxelisedReality | M1", nullptr, nullptr);
+        GLFWwindow* window = glfwCreateWindow(1280, 720, "FlyVoxelisedReality | M2", nullptr, nullptr);
         if (!window) {
             glfwTerminate();
             throw std::runtime_error("Could not create GLFW window");
@@ -348,11 +501,12 @@ int main(int argc, char** argv) {
         DepthEstimator depthEstimator(depthModelPath);
         std::cout << "Depth:  " << depthEstimator.status() << '\n';
         if (!depthEstimator.available()) {
-            std::cout << "        Run scripts/download_depth_model.ps1, then restart for M1 depth.\n";
+            std::cout << "        Run scripts/download_depth_model.ps1, then restart for M1/M2 depth.\n";
         }
-        std::cout << "Keys:   D depth/fallback | Space pause | R reset view | drag orbit | wheel zoom\n";
+        std::cout << "Keys:   F fly/researcher | D depth/fallback | Space pause | R reset | drag orbit | wheel zoom\n";
 
-        const GLuint program = createProgram();
+        const GLuint sceneProgram = createSceneProgram();
+        const GLuint perceptionProgram = createPerceptionProgram();
 
         static constexpr float cubeVertices[] = {
             -1,-1,-1,  0, 0,-1,   1, 1,-1,  0, 0,-1,   1,-1,-1,  0, 0,-1,
@@ -372,12 +526,13 @@ int main(int argc, char** argv) {
         GLuint vao = 0;
         GLuint cubeVbo = 0;
         GLuint instanceVbo = 0;
+        GLuint fullscreenVao = 0;
         glGenVertexArrays(1, &vao);
         glGenBuffers(1, &cubeVbo);
         glGenBuffers(1, &instanceVbo);
+        glGenVertexArrays(1, &fullscreenVao);
 
         glBindVertexArray(vao);
-
         glBindBuffer(GL_ARRAY_BUFFER, cubeVbo);
         glBufferData(GL_ARRAY_BUFFER, sizeof(cubeVertices), cubeVertices, GL_STATIC_DRAW);
         glEnableVertexAttribArray(0);
@@ -394,6 +549,9 @@ int main(int argc, char** argv) {
         glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, sizeof(Instance), reinterpret_cast<void*>(sizeof(glm::vec4)));
         glVertexAttribDivisor(3, 1);
         glBindVertexArray(0);
+
+        RenderTarget sceneTarget;
+        ensureRenderTarget(sceneTarget, state.framebufferW, state.framebufferH);
 
         glEnable(GL_DEPTH_TEST);
         glClearColor(0.018f, 0.024f, 0.032f, 1.0f);
@@ -470,6 +628,8 @@ int main(int argc, char** argv) {
                 ++capturedFrameIndex;
             }
 
+            ensureRenderTarget(sceneTarget, state.framebufferW, state.framebufferH);
+
             const float cp = std::cos(state.pitch);
             const glm::vec3 cameraPosition(
                 state.distance * cp * std::sin(state.yaw),
@@ -478,16 +638,42 @@ int main(int argc, char** argv) {
 
             const glm::mat4 view = glm::lookAt(cameraPosition, glm::vec3(0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
             const float aspect = static_cast<float>(state.framebufferW) / static_cast<float>(std::max(state.framebufferH, 1));
-            const glm::mat4 projection = glm::perspective(45.0f * kPi / 180.0f, aspect, 0.05f, 100.0f);
+            const float renderFov = state.flyVisionEnabled ? kFlyPreviewFovDegrees : kResearcherFovDegrees;
+            const glm::mat4 projection = glm::perspective(renderFov * kPi / 180.0f, aspect, 0.05f, 100.0f);
 
+            // Pass 1: ordinary OpenGL voxel scene into a colour/depth framebuffer.
+            glBindFramebuffer(GL_FRAMEBUFFER, sceneTarget.framebuffer);
+            glViewport(0, 0, sceneTarget.width, sceneTarget.height);
+            glEnable(GL_DEPTH_TEST);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            glUseProgram(program);
-            glUniformMatrix4fv(glGetUniformLocation(program, "uView"), 1, GL_FALSE, glm::value_ptr(view));
-            glUniformMatrix4fv(glGetUniformLocation(program, "uProjection"), 1, GL_FALSE, glm::value_ptr(projection));
 
+            glUseProgram(sceneProgram);
+            glUniformMatrix4fv(glGetUniformLocation(sceneProgram, "uView"), 1, GL_FALSE, glm::value_ptr(view));
+            glUniformMatrix4fv(glGetUniformLocation(sceneProgram, "uProjection"), 1, GL_FALSE, glm::value_ptr(projection));
             glBindVertexArray(vao);
             glDrawArraysInstanced(GL_TRIANGLES, 0, 36, static_cast<GLsizei>(instances.size()));
             glBindVertexArray(0);
+
+            // Pass 2: researcher view is a transparent copy; fly mode performs the
+            // compound-eye post-process over exactly the same rendered world.
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, state.framebufferW, state.framebufferH);
+            glDisable(GL_DEPTH_TEST);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            glUseProgram(perceptionProgram);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, sceneTarget.colourTexture);
+            glUniform1i(glGetUniformLocation(perceptionProgram, "uScene"), 0);
+            glUniform2f(
+                glGetUniformLocation(perceptionProgram, "uResolution"),
+                static_cast<float>(state.framebufferW),
+                static_cast<float>(state.framebufferH));
+            glUniform1i(glGetUniformLocation(perceptionProgram, "uFlyVision"), state.flyVisionEnabled ? 1 : 0);
+            glBindVertexArray(fullscreenVao);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            glBindVertexArray(0);
+            glEnable(GL_DEPTH_TEST);
 
             glfwSwapBuffers(window);
 
@@ -501,8 +687,9 @@ int main(int argc, char** argv) {
                     depthLabel += " " + std::to_string(static_cast<int>(depthEstimator.lastInferenceMs())) + "ms";
                 }
 
+                const std::string perceptionLabel = state.flyVisionEnabled ? "FLY" : "RESEARCHER";
                 const std::string title =
-                    "FlyVoxelisedReality | M1 " + depthLabel + " | " +
+                    "FlyVoxelisedReality | M2 " + perceptionLabel + " | " + depthLabel + " | " +
                     std::to_string(static_cast<int>(fps)) + " FPS | " +
                     std::to_string(instances.size()) + " voxels" +
                     (state.paused ? " | PAUSED" : "");
@@ -513,10 +700,13 @@ int main(int argc, char** argv) {
         }
 
         if (capture.isOpened()) capture.release();
+        destroyRenderTarget(sceneTarget);
+        glDeleteVertexArrays(1, &fullscreenVao);
         glDeleteBuffers(1, &instanceVbo);
         glDeleteBuffers(1, &cubeVbo);
         glDeleteVertexArrays(1, &vao);
-        glDeleteProgram(program);
+        glDeleteProgram(perceptionProgram);
+        glDeleteProgram(sceneProgram);
 
         glfwDestroyWindow(window);
         glfwTerminate();
