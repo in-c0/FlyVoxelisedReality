@@ -201,11 +201,11 @@ void main() {
 
     vec3 sunColour = vec3(1.00, 0.78, 0.55);
     vec3 skyColour = vec3(0.46, 0.62, 0.82);
-    vec3 groundColour = vec3(0.22, 0.16, 0.11);
+    vec3 groundColour = vec3(0.28, 0.22, 0.17);
 
     // Hemisphere ambient keeps wall-facing surfaces readable while retaining form.
     float hemi = N.y * 0.5 + 0.5;
-    vec3 ambient = mix(groundColour, skyColour, hemi) * 0.52;
+    vec3 ambient = mix(groundColour, skyColour, hemi) * 0.66;
 
     // The preset rooms place their main window on the right/back wall. This broad
     // term is intentionally soft rather than a hard painted light patch.
@@ -225,7 +225,12 @@ void main() {
     float blueBias = max(base.b - max(base.r, base.g), 0.0);
     float glassLike = smoothstep(0.08, 0.30, blueBias) * smoothstep(0.40, 0.75, base.b);
     float darkManufactured = 1.0 - smoothstep(0.10, 0.30, luminance);
-    float specularStrength = 0.05 + glassLike * 0.52 + darkManufactured * 0.18;
+    float warmBias = max(base.r - base.b, 0.0);
+    float greenBias = max(base.g - max(base.r, base.b), 0.0);
+    float woodLike = smoothstep(0.08, 0.30, warmBias) * (1.0 - glassLike);
+    float leafLike = smoothstep(0.05, 0.28, greenBias);
+    float specularStrength = 0.035 + glassLike * 0.58 + darkManufactured * 0.16 +
+                             woodLike * 0.035 + leafLike * 0.025;
     float shininess = mix(20.0, 92.0, max(glassLike, darkManufactured * 0.55));
     vec3 H = normalize(sunDir + V);
     float specular = pow(max(dot(N, H), 0.0), shininess) * specularStrength * sunNdotL;
@@ -239,7 +244,10 @@ void main() {
 
     // Additional cavity-like shading on downward-facing surfaces.
     float downFacing = max(-N.y, 0.0);
-    float ambientOcclusion = clamp(contactAO * (1.0 - 0.13 * downFacing), 0.58, 1.0);
+    // Soft floor proximity term darkens contact zones without drawing explicit shadow tiles.
+    float horizontalContact = exp(-floorDistance * 3.2) * (0.35 + 0.65 * (1.0 - abs(N.y)));
+    float ambientOcclusion = clamp(contactAO * (1.0 - 0.11 * downFacing) *
+                                   (1.0 - 0.10 * horizontalContact), 0.64, 1.0);
 
     vec3 colour = base * (ambient * ambientOcclusion + direct) + sunColour * specular;
 
@@ -253,7 +261,7 @@ void main() {
     colour = mix(colour, fogColour, clamp(fog, 0.0, 0.32));
 
     // Exposure + filmic tone mapping + display gamma.
-    colour *= 1.08;
+    colour *= 1.16;
     colour = acesApprox(colour);
     colour = pow(colour, vec3(1.0 / 2.2));
 
@@ -564,7 +572,7 @@ int main(int argc, char** argv) {
         glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-        GLFWwindow* window = glfwCreateWindow(1280, 720, "FlyVoxelisedReality | M2.6 LIGHTING", nullptr, nullptr);
+        GLFWwindow* window = glfwCreateWindow(1280, 720, "FlyVoxelisedReality | M2.7 LIGHTING", nullptr, nullptr);
         if (!window) {
             glfwTerminate();
             throw std::runtime_error("Could not create GLFW window");
@@ -797,7 +805,7 @@ int main(int argc, char** argv) {
                 }
 
                 const std::string title =
-                    "FlyVoxelisedReality | M2.6 " + source + " | " +
+                    "FlyVoxelisedReality | M2.7 " + source + " | " +
                     (state.enhancedLighting ? "LIGHTING" : "LEGACY") + " | " +
                     std::to_string(static_cast<int>(fps)) + " FPS | " +
                     std::to_string(instances.size()) + " voxels | stimulus " +
