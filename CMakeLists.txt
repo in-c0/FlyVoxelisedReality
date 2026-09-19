@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyVoxelisedReality VERSION 0.3.1 LANGUAGES CXX)
+project(FlyVoxelisedReality VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,7 +12,8 @@ find_package(glm CONFIG REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc video videoio dnn)
 
 add_executable(FlyVoxelisedReality
-    src/main_m26.cpp
+    src/main_feasibility.cpp
+    src/neural_model.cpp
     src/depth_estimator.cpp
     src/preset_scenes.cpp
 )
