@@ -1036,6 +1036,8 @@ int main(int argc, char** argv) {
         const GLint locCameraPosition = glGetUniformLocation(program, "uCameraPosition");
         const GLint locSceneMode = glGetUniformLocation(program, "uSceneMode");
         const GLint locEnhancedLighting = glGetUniformLocation(program, "uEnhancedLighting");
+        const GLuint blitProgram = createBlitProgram();
+        const GLint locBlitTexture = glGetUniformLocation(blitProgram, "uTexture");
 
         static constexpr float cubeVertices[] = {
             -1,-1,-1,  0,0,-1,   1,1,-1,  0,0,-1,   1,-1,-1,  0,0,-1,
@@ -1077,6 +1079,58 @@ int main(int argc, char** argv) {
         glVertexAttribDivisor(3, 1);
         glBindVertexArray(0);
 
+        // Offscreen world render. The dashboard reuses this one render instead of
+        // drawing nine independent 3D worlds.
+        constexpr int kSceneRenderW = 640;
+        constexpr int kSceneRenderH = 360;
+        GLuint sceneFbo = 0;
+        GLuint sceneColourTex = 0;
+        GLuint sceneDepthRbo = 0;
+        glGenFramebuffers(1, &sceneFbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo);
+        glGenTextures(1, &sceneColourTex);
+        glBindTexture(GL_TEXTURE_2D, sceneColourTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, kSceneRenderW, kSceneRenderH, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneColourTex, 0);
+        glGenRenderbuffers(1, &sceneDepthRbo);
+        glBindRenderbuffer(GL_RENDERBUFFER, sceneDepthRbo);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, kSceneRenderW, kSceneRenderH);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sceneDepthRbo);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            throw std::runtime_error("Scene framebuffer is incomplete");
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // Fullscreen dashboard blit.
+        static constexpr float quadVertices[] = {
+            -1.0f,-1.0f, 0.0f,1.0f,   1.0f,-1.0f, 1.0f,1.0f,   1.0f,1.0f, 1.0f,0.0f,
+            -1.0f,-1.0f, 0.0f,1.0f,   1.0f,1.0f, 1.0f,0.0f,  -1.0f,1.0f, 0.0f,0.0f
+        };
+        GLuint quadVao = 0, quadVbo = 0, dashboardTexture = 0;
+        glGenVertexArrays(1, &quadVao);
+        glGenBuffers(1, &quadVbo);
+        glBindVertexArray(quadVao);
+        glBindBuffer(GL_ARRAY_BUFFER, quadVbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), nullptr);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), reinterpret_cast<void*>(2*sizeof(float)));
+        glBindVertexArray(0);
+
+        glGenTextures(1, &dashboardTexture);
+        glBindTexture(GL_TEXTURE_2D, dashboardTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, 1280, 720, 0, GL_BGR, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+        std::vector<unsigned char> sceneRgb(static_cast<size_t>(kSceneRenderW*kSceneRenderH*3));
+        std::vector<float> sceneDepth(static_cast<size_t>(kSceneRenderW*kSceneRenderH));
+
         glEnable(GL_DEPTH_TEST);
         glEnable(GL_CULL_FACE);
         glCullFace(GL_BACK);
@@ -1101,7 +1155,12 @@ int main(int argc, char** argv) {
         std::vector<Instance> instances;
         FlyAgent fly;
         VisualStimulus stimulus;
+        VisionFeatures vision;
+        FlyVisualCircuit circuit;
+        MotorCommand motor;
+        std::vector<glm::vec3> trajectory;
         resetFlyForMode(fly, state.sceneMode, office, kitchen);
+        trajectory.push_back(fly.position);
 
         int activeSceneMode = state.sceneMode;
         int capturedFrameIndex = 0;
@@ -1122,6 +1181,11 @@ int main(int argc, char** argv) {
                 activeSceneMode = state.sceneMode;
                 resetFlyForMode(fly, activeSceneMode, office, kitchen);
                 stimulus = VisualStimulus{};
+                vision = VisionFeatures{};
+                motor = MotorCommand{};
+                circuit.reset();
+                trajectory.clear();
+                trajectory.push_back(fly.position);
                 previousGray.release();
                 flow.release();
                 state.distance = activeSceneMode == 3 ? 7.2f : 8.6f;
@@ -1138,7 +1202,6 @@ int main(int argc, char** argv) {
                     cv::cvtColor(small, gray, cv::COLOR_BGR2GRAY);
                     if (!previousGray.empty()) cv::calcOpticalFlowFarneback(previousGray, gray, flow, 0.5, 3, 9, 2, 5, 1.1, 0);
                     else flow = cv::Mat::zeros(gray.size(), CV_32FC2);
-                    gray.copyTo(previousGray);
 
                     if (state.depthEnabled && depthEstimator.available()) {
                         if (depthNearness.empty() || (capturedFrameIndex % kDepthInferenceInterval) == 0) {
@@ -1150,18 +1213,35 @@ int main(int argc, char** argv) {
                     }
                     if (depthNearness.empty()) depthNearness = luminanceFallbackNearness(small);
 
+                    vision = extractVisionFeatures(flow, gray, previousGray);
+                    gray.copyTo(previousGray);
                     stimulus = extractVisualStimulus(flow, depthNearness);
                     instances = frameToVoxels(small, flow, depthNearness);
                     ++capturedFrameIndex;
                 } else {
                     const PresetScene& scene = state.sceneMode == 1 ? office : kitchen;
                     stimulus = makePresetStimulus(scene, elapsed, state.sceneMode);
+                    vision = makePresetVisionFeatures(elapsed, state.sceneMode);
                     instances = presetToInstances(scene);
                     appendStimulusProbe(instances, stimulus);
                 }
 
-                updateFlyAgent(fly, stimulus, dt, state.agentEnabled);
+                motor = circuit.update(vision, dt);
+                updateFlyFromMotor(fly, motor, dt, state.agentEnabled);
+                const NeuralState& neural = circuit.state();
+                fly.retina = neural.r1r6;
+                fly.lamina = std::max(neural.l1, neural.l2);
+                fly.medulla = std::max({neural.mi1, neural.tm3, neural.tm1, neural.tm2});
+                fly.lobula = std::max({
+                    *std::max_element(neural.t4.begin(), neural.t4.end()),
+                    *std::max_element(neural.t5.begin(), neural.t5.end()),
+                    neural.lc4, neural.lplc2
+                });
                 appendFlyInstances(instances, fly);
+                if (trajectory.empty() || glm::length(trajectory.back() - fly.position) > 0.06f) {
+                    trajectory.push_back(fly.position);
+                    if (trajectory.size() > 120) trajectory.erase(trajectory.begin());
+                }
 
                 if (instances.size() > static_cast<size_t>(kMaxInstances)) {
                     throw std::runtime_error("Scene exceeded kMaxInstances");
@@ -1182,14 +1262,16 @@ int main(int argc, char** argv) {
             else if (state.sceneMode == 2) lookTarget = kitchen.focusTarget;
 
             const glm::mat4 view = glm::lookAt(cameraPosition, lookTarget, glm::vec3(0.0f, 1.0f, 0.0f));
-            const float aspect = static_cast<float>(state.framebufferW) / static_cast<float>(std::max(state.framebufferH, 1));
+            const float aspect = static_cast<float>(kSceneRenderW) / static_cast<float>(kSceneRenderH);
             const glm::mat4 projection = glm::perspective(45.0f * kPi / 180.0f, aspect, 0.05f, 100.0f);
 
-            if (state.enhancedLighting && state.sceneMode != 3) {
-                glClearColor(0.030f, 0.035f, 0.040f, 1.0f);
-            } else {
-                glClearColor(0.018f, 0.024f, 0.032f, 1.0f);
-            }
+            // 5 MAIN WORLD: render once offscreen.
+            glBindFramebuffer(GL_FRAMEBUFFER, sceneFbo);
+            glViewport(0, 0, kSceneRenderW, kSceneRenderH);
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
+            if (state.enhancedLighting && state.sceneMode != 3) glClearColor(0.030f, 0.035f, 0.040f, 1.0f);
+            else glClearColor(0.018f, 0.024f, 0.032f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
             glUseProgram(program);
@@ -1198,10 +1280,58 @@ int main(int argc, char** argv) {
             glUniform3fv(locCameraPosition, 1, glm::value_ptr(cameraPosition));
             glUniform1i(locSceneMode, state.sceneMode);
             glUniform1i(locEnhancedLighting, state.enhancedLighting ? 1 : 0);
-
             glBindVertexArray(vao);
             glDrawArraysInstanced(GL_TRIANGLES, 0, 36, static_cast<GLsizei>(instances.size()));
             glBindVertexArray(0);
+
+            glReadPixels(0, 0, kSceneRenderW, kSceneRenderH, GL_RGB, GL_UNSIGNED_BYTE, sceneRgb.data());
+            glReadPixels(0, 0, kSceneRenderW, kSceneRenderH, GL_DEPTH_COMPONENT, GL_FLOAT, sceneDepth.data());
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+            cv::Mat sceneRgbMat(kSceneRenderH, kSceneRenderW, CV_8UC3, sceneRgb.data());
+            cv::Mat sceneRgbFlipped;
+            cv::flip(sceneRgbMat, sceneRgbFlipped, 0);
+            cv::Mat sceneBgr;
+            cv::cvtColor(sceneRgbFlipped, sceneBgr, cv::COLOR_RGB2BGR);
+
+            cv::Mat depthFloat(kSceneRenderH, kSceneRenderW, CV_32F, sceneDepth.data());
+            cv::Mat depthFloatFlipped;
+            cv::flip(depthFloat, depthFloatFlipped, 0);
+            cv::Mat depthByte = (state.sceneMode == 3 && !depthNearness.empty())
+                ? depthByteFromNearness(depthNearness)
+                : depthByteFromGL(depthFloatFlipped);
+
+            const cv::Mat sourcePanel = (state.sceneMode == 3 && !frame.empty()) ? frame : sceneBgr;
+            const cv::Mat segmentation = makeRegionSegmentation(depthByte);
+            const cv::Mat motionPanel = makeMotionViz(flow, vision);
+            const NeuralState& neural = circuit.state();
+            const cv::Mat neuralMap = makeNeuralMapViz(neural);
+            const cv::Mat neuralRender = applyLearnedNeuralRender(sceneBgr, neural);
+            const cv::Mat behaviour = makeBehaviourViz(trajectory, fly, motor);
+            const cv::Mat trace = makeCausalTrace(vision, neural, motor);
+            cv::Mat dashboard = composeDashboard(
+                sourcePanel, depthByte, segmentation, motionPanel, sceneBgr,
+                neuralMap, neuralRender, behaviour, trace);
+
+            cv::Mat display;
+            if (state.dashboardEnabled) display = dashboard;
+            else cv::resize(sceneBgr, display, cv::Size(1280,720), 0.0, 0.0, cv::INTER_LINEAR);
+
+            glViewport(0, 0, state.framebufferW, state.framebufferH);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glClearColor(0.005f,0.008f,0.012f,1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glUseProgram(blitProgram);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, dashboardTexture);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1280, 720, GL_BGR, GL_UNSIGNED_BYTE, display.data);
+            glUniform1i(locBlitTexture, 0);
+            glBindVertexArray(quadVao);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+            glBindVertexArray(0);
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_CULL_FACE);
             glfwSwapBuffers(window);
 
             titleAccumulator += dt;
@@ -1219,8 +1349,8 @@ int main(int argc, char** argv) {
                 }
 
                 const std::string title =
-                    "FlyVoxelisedReality | M2.7 " + source + " | " +
-                    (state.enhancedLighting ? "LIGHTING" : "LEGACY") + " | " +
+                    "FlyVoxelisedReality | M3-M7 " + source + " | " +
+                    (state.dashboardEnabled ? "DASHBOARD" : "WORLD") + " | " +
                     std::to_string(static_cast<int>(fps)) + " FPS | " +
                     std::to_string(instances.size()) + " voxels | stimulus " +
                     std::to_string(stimulusPercent) + "% | pathway " + std::to_string(neuralPercent) + "%" +
@@ -1233,6 +1363,13 @@ int main(int argc, char** argv) {
         }
 
         if (capture.isOpened()) capture.release();
+        glDeleteTextures(1, &dashboardTexture);
+        glDeleteTextures(1, &sceneColourTex);
+        glDeleteRenderbuffers(1, &sceneDepthRbo);
+        glDeleteFramebuffers(1, &sceneFbo);
+        glDeleteBuffers(1, &quadVbo);
+        glDeleteVertexArrays(1, &quadVao);
+        glDeleteProgram(blitProgram);
         glDeleteBuffers(1, &instanceVbo);
         glDeleteBuffers(1, &cubeVbo);
         glDeleteVertexArrays(1, &vao);
