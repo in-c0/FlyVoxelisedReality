@@ -161,23 +161,6 @@ void addWindow(PresetScene& scene, glm::vec3 centre, int nx, int ny) {
     }
 }
 
-void addSunPatch(PresetScene& scene, glm::vec3 centre, int nx, int nz) {
-    const glm::vec3 sunlight(0.91f, 0.70f, 0.39f);
-    for (int ix = 0; ix < nx; ++ix) {
-        for (int iz = 0; iz < nz; ++iz) {
-            // Broken-up patch avoids reading as a literal yellow rectangle.
-            const glm::vec3 p{
-                centre.x + (ix - (nx - 1) * 0.5f) * kStep,
-                centre.y,
-                centre.z + (iz - (nz - 1) * 0.5f) * kStep
-            };
-            if (hash01(p + glm::vec3(2.4f, 0.0f, 1.7f)) > 0.17f) {
-                addVoxel(scene, p, sunlight, 0.078f, 0.10f);
-            }
-        }
-    }
-}
-
 } // namespace
 
 PresetScene makeOfficeScene() {
@@ -240,9 +223,6 @@ PresetScene makeOfficeScene() {
     addBox(scene, {-2.58f, 0.05f, -2.05f}, 2, 4, 2, glm::vec3(0.57f, 0.24f, 0.17f));
     addBox(scene, {-2.28f, 0.04f, -2.05f}, 2, 4, 2, glm::vec3(0.18f, 0.35f, 0.49f));
     addBox(scene, {-2.42f, 0.98f, -2.05f}, 3, 2, 2, glm::vec3(0.58f, 0.54f, 0.28f));
-
-    // Baked warm daylight patch from the right-side window.
-    addSunPatch(scene, {1.18f, -1.535f, 0.70f}, 12, 10);
 
     return scene;
 }
@@ -308,10 +288,6 @@ PresetScene makeKitchenScene() {
     addBox(scene, {0.0f, 2.13f, -0.20f}, 7, 2, 7, glm::vec3(0.82f, 0.66f, 0.31f));
     addBox(scene, {0.0f, 2.51f, -0.20f}, 1, 4, 1, glm::vec3(0.21f, 0.20f, 0.18f));
     addBox(scene, {0.0f, 1.95f, -0.20f}, 4, 1, 4, glm::vec3(0.96f, 0.79f, 0.42f), 0.01f);
-
-    // Warm window light across table/floor for a more intentional hero composition.
-    addSunPatch(scene, {1.15f, -1.535f, 0.62f}, 13, 11);
-    addSunPatch(scene, {1.05f, -0.255f, -0.15f}, 8, 7);
 
     return scene;
 }
