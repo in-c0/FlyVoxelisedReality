@@ -70,6 +70,77 @@ The four named stages are real major parts of the fly visual system, but the cur
 
 Four small activity nodes float above the fly in the order `retina → lamina → medulla → lobula`; their activation follows the stimulus. The fly body, neural nodes, preset worlds and live reconstruction all use the same OpenGL instanced-cube renderer.
 
+
+## M3-M7 feasibility spike
+
+The repository now includes a deliberately compressed end-to-end feasibility build. Its purpose is to answer whether the architecture can run as one realtime system before investing in biological fidelity or UI polish.
+
+### M3 — literature-grounded fly visual map
+
+The old four-stage scalar placeholder has been replaced by a compact graph using real Drosophila visual cell types:
+
+```text
+R1-R6
+  ├─ L1 → Mi1 / Tm3 / Mi4 / Mi9 → T4 directional populations
+  └─ L2 → Tm1 / Tm2 / Tm4 / Tm9 → T5 directional populations
+
+T4/T5 → large-field HS/VS summary
+looming → LC4 + LPLC2 → giant-fibre escape summary
+```
+
+The **topology and cell-type names are literature-grounded**; the scalar activation dynamics, gains and aggregation are engineering proxies. This is not a biophysical simulation and does not claim to reproduce the full FlyWire connectome.
+
+Relevant scientific basis includes the FlyWire whole-brain connectome and the established ON/OFF motion pathways upstream of T4/T5, plus looming-sensitive LC4/LPLC2 pathways.
+
+### M4 — realtime CV → neural features
+
+Live camera mode now extracts, in realtime:
+
+- ON and OFF luminance changes
+- left/right/up/down optical-flow energy
+- outward radial flow as a simple looming cue
+- motion-weighted object position
+- monocular relative depth
+
+Preset scenes generate controlled versions of the same feature vector so the neural loop can be tested repeatably.
+
+### M5 — neural state → behaviour
+
+T4/T5 directional activity and looming/escape activity feed a bounded motor readout that changes fly heading, pitch and speed inside the same voxel world.
+
+The motor readout is intentionally a **proxy**. It proves that the neural state can close the sensorimotor loop in realtime; it is not a reconstructed descending/motor connectome.
+
+### M6 — nine-surface realtime dashboard
+
+The integrated executable composes all nine target surfaces every frame:
+
+1. source RGB
+2. depth
+3. region segmentation
+4. motion / looming
+5. main voxel world
+6. live fly neural-map activity
+7. learned neural-render preview
+8. fly behaviour / trajectory
+9. causal trace from stimulus to motor output
+
+The expensive 3D world is rendered only once to an OpenGL framebuffer; the diagnostic panels reuse that render and the CV/neural intermediate buffers.
+
+Press **Tab** to switch between the dashboard and the raw world view.
+
+### M7 — bounded learned neural rendering
+
+The neural-render panel performs actual learned inference using a tiny 7→10→3 MLP conditioned on:
+
+```text
+RGB + motion activity + looming/escape activity + ON activity + OFF activity
+```
+
+The network was trained on a synthetic supervised appearance mapping and its weights are baked into the C++ feasibility executable. It is intentionally small and reproducible; it demonstrates that a learned neural-state-conditioned rendering stage fits inside the realtime loop, but it is **not a NeRF, Gaussian-splatting model, or biologically faithful perceptual reconstruction**.
+
+The training script is in `tools/train_neural_renderer.py`.
+
+
 ## Locked dashboard target
 
 The final prototype UI is organised around **cause → processing → neural activity → behaviour**, rather than nine unrelated visual effects.
@@ -142,6 +213,7 @@ NEURAL APPEARANCE
 - `A` — enable/disable fly steering while keeping neural activity visible
 - `D` — toggle monocular depth vs brightness fallback in live mode
 - `R` — reset researcher camera orbit
+- `Tab` — toggle 9-surface feasibility dashboard / raw world
 - Drag with **left mouse** — orbit
 - Mouse wheel — zoom
 
@@ -181,14 +253,15 @@ cmake --build build --config Release
 
 ## Milestones
 
-- [x] Repository + architecture scaffold
 - [x] **M0:** webcam → OpenCV → live OpenGL voxel field
-- [x] **M1:** relative monocular depth → spatial voxel reconstruction
-- [ ] **M2:** preset scenes + fly agent + repeatable visual stimulus (implemented; awaiting local validation)
-- [ ] **M3:** real Drosophila visual-pathway map + live activation
-- [ ] **M4:** nine-surface researcher dashboard + interaction / inspection modes
-- [ ] **M5:** bounded neural-rendering experiment
-- [ ] **M6:** public demo video + technical write-up
+- [x] **M1:** monocular relative depth → spatial voxel reconstruction
+- [x] **M2:** preset scenes + fly agent + controlled stimuli
+- [x] **M3 feasibility:** literature-grounded Drosophila visual circuit graph + live activation
+- [x] **M4 feasibility:** realtime CV features → mapped neural inputs
+- [x] **M5 feasibility:** neural state → closed-loop fly movement
+- [x] **M6 feasibility:** nine-surface realtime researcher dashboard
+- [x] **M7 feasibility:** learned neural-state-conditioned render in the realtime loop
+- [ ] **M8:** publication-quality demo / group-project handoff, only if the feasibility spike is worth continuing
 
 ## Design rule
 
